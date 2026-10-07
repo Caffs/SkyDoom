@@ -27,6 +27,7 @@ need your own legitimate supported copies of:
 - Skyrim Special Edition / Anniversary Edition
 - DOOM + DOOM II
 - SKSE for the supported Skyrim runtime
+- [Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444) for Skyrim SE/AE
 
 Steam: https://store.steampowered.com/app/2280/DOOM__DOOM_II/
 
@@ -35,6 +36,36 @@ in the UK**. Steam pricing and sales can change.
 
 SkyDoom automatically discovers the player's own legitimate `DOOM.WAD` from
 their Steam libraries, so there is no need to copy DOOM WAD files into the mod.
+
+## Installation
+
+### Mod manager (recommended)
+
+1. Make sure the tested Skyrim runtime, matching SKSE version, and Address Library are installed.
+2. Make sure **DOOM + DOOM II** is installed through Steam.
+3. Download **SkyDoom-v0.1.0-beta.zip** from the [v0.1.0-beta release page](https://github.com/Caffs/SkyDoom/releases/tag/v0.1.0-beta).
+4. Install the ZIP with Vortex or Mod Organizer 2.
+5. Launch Skyrim through SKSE.
+
+SkyDoom will automatically search the player's Steam libraries for their own legitimate `DOOM.WAD`.
+
+Do **not** copy `DOOM.WAD`, `DOOM2.WAD`, or other DOOM game data into the SkyDoom mod.
+
+### Manual installation
+
+1. Install the tested Skyrim runtime, matching SKSE version, and Address Library.
+2. Make sure **DOOM + DOOM II** is installed through Steam.
+3. Download **SkyDoom-v0.1.0-beta.zip** from the [release page](https://github.com/Caffs/SkyDoom/releases/tag/v0.1.0-beta).
+4. Open the ZIP and copy its `SKSE` folder into your Skyrim `Data` folder, preserving the folder structure.
+5. Launch Skyrim through SKSE.
+
+The installed plugin should end up at:
+
+`Data\SKSE\Plugins\skydoomskse.dll`
+
+The bundled Chocolate Doom runtime should remain under:
+
+`Data\SKSE\Plugins\SkyDoom\Runtime\`
 
 ## What SkyDoom currently does
 
