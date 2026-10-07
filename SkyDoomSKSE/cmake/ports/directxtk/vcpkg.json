@@ -1,0 +1,7 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+    "name": "directxtk",
+    "version": "24.2.0",
+    "description": "DirectX Tool Kit headers (header-only overlay — skips shader compilation).",
+    "license": "MIT"
+}

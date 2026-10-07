@@ -1,0 +1,7 @@
+extends: existence
+message: "Use descriptive link text instead of '%s'."
+level: warning
+ignorecase: true
+tokens:
+  - click here
+  - this link

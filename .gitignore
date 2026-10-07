@@ -1,0 +1,47 @@
+# Build output
+build/
+out/
+.vs/
+.vscode/
+CMakeUserPresets.json
+
+# vcpkg/generated dependency caches
+downloads/
+buildtrees/
+packages/
+installed/
+
+# Compiled output
+*.exe
+*.dll
+*.pdb
+*.lib
+*.obj
+*.ilk
+*.pch
+*.ipch
+*.VC.db
+
+# Local/dev backup files
+*.before-*
+*.bak
+*.orig
+*.rej
+
+# Game data - NEVER COMMIT
+*.wad
+*.bsa
+*.ba2
+*.esm
+*.esp
+*.esl
+
+# Music/game assets - NEVER COMMIT
+*.ogg
+*.mp3
+*.flac
+*.wav
+
+# Misc
+.DS_Store
+Thumbs.db

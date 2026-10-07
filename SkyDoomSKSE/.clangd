@@ -1,0 +1,15 @@
+# clangd configuration for Neovim (nvim-lspconfig or similar LSP client)
+#
+# Generate compile_commands.json with:
+#   cmake --preset release-linux
+#   ln -sf build/release-linux/compile_commands.json compile_commands.json
+#
+# This tells clangd we are cross-compiling for Windows x64 from Linux,
+# so it resolves Windows SDK / MSVC headers correctly.
+
+CompileFlags:
+  Add:
+    - "--target=x86_64-pc-windows-msvc"
+
+Diagnostics:
+  UnusedIncludes: Strict

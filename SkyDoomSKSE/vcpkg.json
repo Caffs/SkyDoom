@@ -1,0 +1,17 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+    "name": "skydoomskse",
+    "version-string": "0.1.0",
+    "builtin-baseline": "4bc07e3eb00c5a9539a5a7a83415150a9260f8db",
+    "dependencies": [
+        "spdlog",
+        "directxtk",
+        "rapidcsv"
+    ],
+    "features": {
+        "tests": {
+            "description": "Catch2 unit tests",
+            "dependencies": ["catch2"]
+        }
+    }
+}

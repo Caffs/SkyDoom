@@ -1,0 +1,3857 @@
+#include "PCH.h"
+#include "skydoom_protocol.h"
+
+#include <Windows.h>
+
+#include <d3d11.h>
+#include <d3dcompiler.h>
+#include <dxgi.h>
+
+#include <wrl/client.h>
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef min
+#	undef min
+#endif
+
+#ifdef max
+#	undef max
+#endif
+
+namespace
+{
+	using Microsoft::WRL::ComPtr;
+
+	// ========================================================
+	// SKYDOOM CORE
+	// ========================================================
+
+	HANDLE g_mapping = nullptr;
+
+	SkyDoomSharedState* g_state =
+		nullptr;
+
+	HANDLE g_doomProcess =
+		nullptr;
+
+	HANDLE g_doomJob =
+		nullptr;
+
+	std::atomic_bool g_running =
+		false;
+
+	std::atomic_bool g_taskPending =
+		false;
+
+	std::jthread g_updateThread;
+
+	std::uint32_t g_inputSequence =
+		0;
+
+	// SKYDOOM_PHYSICAL_LMB_V4
+	std::mutex g_inputRingMutex;
+
+	bool g_physicalFireDown =
+	    false;
+
+    // ========================================================
+    // SKYDOOM PISTOL COMBAT BRIDGE
+    // ========================================================
+
+    // SKYDOOM_PISTOL_COMBAT_BRIDGE_V4
+
+    constexpr std::int32_t
+        SKYDOOM_DOOM_WEAPON_PISTOL =
+            1;
+
+
+    /*
+        Temporary plumbing-test damage.
+
+        Authentic DOOM pistol damage is variable.
+        Once this bridge is proven, the exact DOOM-side
+        damage roll will be transported through the protocol.
+    */
+
+    constexpr float
+        SKYDOOM_PISTOL_TEST_DAMAGE =
+            10.0f;
+
+    /*
+        Maximum Skyrim-world distance for the DOOM pistol
+        hitscan.
+
+        8192 Skyrim units is a little over 100 metres.
+    */
+
+    constexpr float
+        SKYDOOM_PISTOL_HITSCAN_RANGE =
+            8192.0f;
+
+
+
+    bool
+        g_haveDoomCombatSnapshot =
+            false;
+
+
+    std::int32_t
+        g_lastDoomBullets =
+            0;
+
+
+    std::int32_t
+        g_lastDoomWeapon =
+            -1;
+
+
+    std::uint64_t
+        g_lastDoomCombatTick =
+            0;
+
+
+	bool g_inputSinkRegistered =
+		false;
+
+	bool g_reportedDoomConnected =
+		false;
+
+	constexpr wchar_t DOOM_EXE_PATH[] =
+		L"C:\\SkyDoom\\chocolate-doom\\build\\src\\Release\\chocolate-doom.exe";
+
+	constexpr wchar_t DOOM_WORKING_DIRECTORY[] =
+		L"C:\\SkyDoom\\chocolate-doom\\build\\src\\Release";
+
+	constexpr wchar_t DOOM_WAD_PATH[] =
+		L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Ultimate Doom\\base\\DOOM.WAD";
+
+	constexpr std::uint64_t DOOM_FRESH_MS =
+		1500;
+
+	// ========================================================
+	// D3D11 OVERLAY
+	// ========================================================
+
+	using PresentFn =
+		HRESULT(__stdcall*)(
+			IDXGISwapChain*,
+			UINT,
+			UINT);
+
+	using ResizeBuffersFn =
+		HRESULT(__stdcall*)(
+			IDXGISwapChain*,
+			UINT,
+			UINT,
+			UINT,
+			DXGI_FORMAT,
+			UINT);
+
+	PresentFn g_originalPresent =
+		nullptr;
+
+	ResizeBuffersFn g_originalResizeBuffers =
+		nullptr;
+
+	ComPtr<ID3D11Device>
+		g_device;
+
+	ComPtr<ID3D11DeviceContext>
+		g_context;
+
+	ComPtr<ID3D11RenderTargetView>
+		g_backBufferRTV;
+
+	ComPtr<ID3D11Texture2D>
+		g_overlayTexture;
+
+	ComPtr<ID3D11ShaderResourceView>
+		g_overlaySRV;
+
+	ComPtr<ID3D11VertexShader>
+		g_vertexShader;
+
+	ComPtr<ID3D11PixelShader>
+		g_pixelShader;
+
+	ComPtr<ID3D11InputLayout>
+		g_inputLayout;
+
+	ComPtr<ID3D11Buffer>
+		g_vertexBuffer;
+
+	ComPtr<ID3D11SamplerState>
+		g_pointSampler;
+
+	ComPtr<ID3D11BlendState>
+		g_alphaBlend;
+
+	ComPtr<ID3D11DepthStencilState>
+		g_depthDisabled;
+
+	ComPtr<ID3D11RasterizerState>
+		g_rasterizer;
+
+	std::array<
+		std::uint8_t,
+		SKYDOOM_OVERLAY_RGBA_BYTES>
+		g_overlayPixels{};
+
+	std::uint64_t g_lastOverlayFrame =
+		0;
+
+	std::uint32_t g_backBufferWidth =
+		0;
+
+	std::uint32_t g_backBufferHeight =
+		0;
+
+	bool g_renderHookInstalled =
+		false;
+
+	// SKYDOOM_PRESENTATION_STATE_V4
+	bool g_skyDoomDisabledFightingControls = false;
+	bool g_skyDoomCulledFirstPerson = false;
+
+	struct OverlayVertex
+	{
+		float x;
+		float y;
+		float z;
+
+		float u;
+		float v;
+	};
+
+	// ========================================================
+	// SHADERS
+	// ========================================================
+
+	constexpr const char SKYDOOM_VERTEX_SHADER[] = R"(
+        struct VSInput
+        {
+            float3 position : POSITION;
+            float2 texcoord : TEXCOORD0;
+        };
+
+        struct VSOutput
+        {
+            float4 position : SV_POSITION;
+            float2 texcoord : TEXCOORD0;
+        };
+
+        VSOutput main(VSInput input)
+        {
+            VSOutput output;
+
+            output.position =
+                float4(
+                    input.position,
+                    1.0
+                );
+
+            output.texcoord =
+                input.texcoord;
+
+            return output;
+        }
+    )";
+
+	constexpr const char SKYDOOM_PIXEL_SHADER[] = R"(
+        Texture2D overlayTexture : register(t0);
+
+        SamplerState overlaySampler : register(s0);
+
+        struct PSInput
+        {
+            float4 position : SV_POSITION;
+            float2 texcoord : TEXCOORD0;
+        };
+
+        float4 main(PSInput input) : SV_TARGET
+        {
+            return overlayTexture.Sample(
+                overlaySampler,
+                input.texcoord
+            );
+        }
+    )";
+
+	// ========================================================
+	// LOGGING
+	// ========================================================
+
+	void SetupLog()
+	{
+		auto logsFolder =
+			logger::log_directory();
+
+		if (!logsFolder) {
+			util::report_and_fail(
+				"SKSE log_directory not provided, logs can't be written");
+		}
+
+		const auto* plugin =
+			SKSE::PluginDeclaration::
+				GetSingleton();
+
+		const auto logName =
+			plugin ?
+				std::string{
+					plugin->GetName()
+				} +
+					".log" :
+				"Plugin.log";
+
+		auto logPath =
+			*logsFolder /
+			logName;
+
+		auto fileSink =
+			std::make_shared<
+				spdlog::sinks::
+					basic_file_sink_mt>(
+				logPath.string(),
+				true);
+
+		std::vector<
+			spdlog::sink_ptr>
+			sinks{
+				fileSink
+			};
+
+		if (IsDebuggerPresent()) {
+			sinks.push_back(
+				std::make_shared<
+					spdlog::sinks::
+						msvc_sink_mt>());
+		}
+
+		auto spdlogger =
+			std::make_shared<
+				spdlog::logger>(
+				"global",
+				sinks.begin(),
+				sinks.end());
+
+		spdlog::set_default_logger(
+			std::move(
+				spdlogger));
+
+		spdlog::set_pattern(
+			"[%H:%M:%S.%e] [%l] [%s:%#] %v");
+
+#ifdef NDEBUG
+
+		spdlog::set_level(
+			spdlog::level::info);
+
+#else
+
+		spdlog::set_level(
+			spdlog::level::trace);
+
+#endif
+
+		spdlog::flush_on(
+			spdlog::level::info);
+	}
+
+	// ========================================================
+	// SHARED MEMORY
+	// ========================================================
+
+	void InitializeProtocolIfNeeded(
+		bool newlyCreated)
+	{
+		if (!g_state) {
+			return;
+		}
+
+		if (
+			newlyCreated ||
+			g_state->magic !=
+				SKYDOOM_MAGIC ||
+			g_state->version !=
+				SKYDOOM_VERSION ||
+			g_state->struct_size !=
+				sizeof(
+					SkyDoomSharedState)) {
+			ZeroMemory(
+				g_state,
+				sizeof(
+					SkyDoomSharedState));
+
+			g_state->magic =
+				SKYDOOM_MAGIC;
+
+			g_state->version =
+				SKYDOOM_VERSION;
+
+			g_state->struct_size =
+				static_cast<
+					std::uint32_t>(
+					sizeof(
+						SkyDoomSharedState));
+
+			g_state->protocol_flags =
+				SKYDOOM_PROTOCOL_FLAG_GUEST_MODE;
+
+			g_state->overlay.width =
+				SKYDOOM_OVERLAY_WIDTH;
+
+			g_state->overlay.height =
+				SKYDOOM_OVERLAY_HEIGHT;
+
+			g_state->overlay.flags =
+				SKYDOOM_OVERLAY_FLAG_WEAPON;
+		}
+	}
+
+	bool InitSharedMemory()
+	{
+		g_mapping =
+			CreateFileMappingA(
+				INVALID_HANDLE_VALUE,
+				nullptr,
+				PAGE_READWRITE,
+				0,
+				sizeof(
+					SkyDoomSharedState),
+				SKYDOOM_MAPPING_NAME);
+
+		if (!g_mapping) {
+			logger::error(
+				"CreateFileMappingA failed. Win32 error: {}",
+				GetLastError());
+
+			return false;
+		}
+
+		const DWORD creationStatus =
+			GetLastError();
+
+		const bool newlyCreated =
+			creationStatus !=
+			ERROR_ALREADY_EXISTS;
+
+		g_state =
+			static_cast<
+				SkyDoomSharedState*>(
+				MapViewOfFile(
+					g_mapping,
+					FILE_MAP_ALL_ACCESS,
+					0,
+					0,
+					sizeof(
+						SkyDoomSharedState)));
+
+		if (!g_state) {
+			logger::error(
+				"MapViewOfFile failed. Win32 error: {}",
+				GetLastError());
+
+			CloseHandle(
+				g_mapping);
+
+			g_mapping =
+				nullptr;
+
+			return false;
+		}
+
+		InitializeProtocolIfNeeded(
+			newlyCreated);
+
+		g_state->skyrim.running =
+			1;
+
+		g_state->skyrim.pid =
+			GetCurrentProcessId();
+
+		g_state->skyrim.heartbeat_ms =
+			GetTickCount64();
+
+		logger::info(
+			"Connected to SkyDoom Visual Overlay v4 shared memory");
+
+		return true;
+	}
+
+	// ========================================================
+	// INPUT RING
+	// ========================================================
+
+	void PushInputEvent(
+		std::uint16_t type,
+		std::uint16_t code,
+		std::int32_t  value)
+	{
+        // SKYDOOM_INPUT_RING_LOCK_V4
+        std::scoped_lock inputLock(
+            g_inputRingMutex
+        );
+		if (!g_state) {
+			return;
+		}
+
+		auto& ring =
+			g_state->input;
+
+		const std::uint32_t head =
+			ring.head;
+
+		const std::uint32_t tail =
+			ring.tail;
+
+		if (
+			(head - tail) >=
+			SKYDOOM_INPUT_RING_ENTRIES) {
+			ring.dropped++;
+
+			return;
+		}
+
+		auto& event =
+			ring.events[head &
+						SKYDOOM_INPUT_RING_MASK];
+
+		event.type =
+			type;
+
+		event.code =
+			code;
+
+		event.value =
+			value;
+
+		event.sequence =
+			++g_inputSequence;
+
+		event.reserved =
+			0;
+
+		MemoryBarrier();
+
+		ring.head =
+			head + 1u;
+	}
+
+	class SkyDoomInputSink final :
+		public RE::BSTEventSink<
+			RE::InputEvent*>
+	{
+	public:
+		static SkyDoomInputSink*
+			GetSingleton()
+		{
+			static SkyDoomInputSink
+				singleton;
+
+			return &singleton;
+		}
+
+		RE::BSEventNotifyControl
+			ProcessEvent(
+				RE::InputEvent* const*
+					a_eventList,
+				RE::BSTEventSource<
+					RE::InputEvent*>*) override
+		{
+			if (
+				!g_state ||
+				!a_eventList ||
+				!*a_eventList) {
+				return RE::BSEventNotifyControl::
+					kContinue;
+			}
+
+			auto* ui =
+				RE::UI::GetSingleton();
+
+			if (
+				ui &&
+				ui->GameIsPaused()) {
+				return RE::BSEventNotifyControl::
+					kContinue;
+			}
+
+			auto* userEvents =
+				RE::UserEvents::
+					GetSingleton();
+
+			if (!userEvents) {
+				return RE::BSEventNotifyControl::
+					kContinue;
+			}
+
+			for (
+				auto* event =
+					*a_eventList;
+				event;
+				event =
+					event->next) {
+				auto* button =
+					event->AsButtonEvent();
+
+				if (!button) {
+					continue;
+				}
+
+				std::int32_t state;
+
+				if (
+					button->IsDown()) {
+					state =
+						1;
+				} else if (
+					button->IsUp()) {
+					state =
+						0;
+				} else {
+					continue;
+				}
+
+				const auto& name =
+					button->QUserEvent();
+
+				std::uint16_t code =
+					0;
+
+				if (
+					name ==
+					userEvents->forward) {
+					code =
+						SKYDOOM_INPUT_FORWARD;
+				} else if (
+					name ==
+					userEvents->back) {
+					code =
+						SKYDOOM_INPUT_BACK;
+				} else if (
+					name ==
+					userEvents->strafeLeft) {
+					code =
+						SKYDOOM_INPUT_STRAFE_LEFT;
+				} else if (
+					name ==
+					userEvents->strafeRight) {
+					code =
+						SKYDOOM_INPUT_STRAFE_RIGHT;
+				} else if (
+					name ==
+						userEvents->sprint ||
+					name ==
+						userEvents->run) {
+					code =
+						SKYDOOM_INPUT_RUN;
+				} else if (
+					name ==
+					userEvents->rightAttack) {
+					code =
+						SKYDOOM_INPUT_FIRE;
+				} else if (
+					name ==
+					userEvents->activate) {
+					code =
+						SKYDOOM_INPUT_USE;
+				} else if (
+					name ==
+					userEvents->jump) {
+					code =
+						SKYDOOM_INPUT_JUMP;
+				}
+
+				if (code != 0) {
+					PushInputEvent(
+						SKYDOOM_INPUT_EVENT_BUTTON,
+						code,
+						state);
+				}
+			}
+
+			return RE::BSEventNotifyControl::
+				kContinue;
+		}
+	};
+
+	bool RegisterInputSink()
+	{
+		if (
+			g_inputSinkRegistered) {
+			return true;
+		}
+
+		auto* inputManager =
+			RE::BSInputDeviceManager::
+				GetSingleton();
+
+		if (!inputManager) {
+			logger::error(
+				"BSInputDeviceManager unavailable");
+
+			return false;
+		}
+
+		inputManager->AddEventSink(
+			SkyDoomInputSink::
+				GetSingleton());
+
+		g_inputSinkRegistered =
+			true;
+
+		logger::info(
+			"SkyDoom input sink registered");
+
+		return true;
+	}
+
+	// ========================================================
+	// HIDDEN DOOM GUEST
+	// ========================================================
+
+	bool DoomHeartbeatIsFresh()
+	{
+		if (
+			!g_state ||
+			!g_state->doom.running) {
+			return false;
+		}
+
+		const auto heartbeat =
+			g_state->doom.heartbeat_ms;
+
+		if (
+			heartbeat == 0) {
+			return false;
+		}
+
+		const auto now =
+			static_cast<
+				std::uint64_t>(
+				GetTickCount64());
+
+		if (
+			now < heartbeat) {
+			return true;
+		}
+
+		return (now - heartbeat) <=
+		       DOOM_FRESH_MS;
+	}
+
+	bool LaunchDoomGuest()
+	{
+		if (g_doomProcess) {
+			DWORD exitCode =
+				0;
+
+			if (
+				GetExitCodeProcess(
+					g_doomProcess,
+					&exitCode) &&
+				exitCode ==
+					STILL_ACTIVE) {
+				return true;
+			}
+
+			CloseHandle(
+				g_doomProcess);
+
+			g_doomProcess =
+				nullptr;
+		}
+
+		if (!g_doomJob) {
+			g_doomJob =
+				CreateJobObjectW(
+					nullptr,
+					nullptr);
+
+			if (!g_doomJob) {
+				logger::error(
+					"CreateJobObjectW failed. Win32 error: {}",
+					GetLastError());
+
+				return false;
+			}
+
+			JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+			jobInfo{};
+
+			jobInfo.BasicLimitInformation.LimitFlags =
+				JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+			if (
+				!SetInformationJobObject(
+					g_doomJob,
+					JobObjectExtendedLimitInformation,
+					&jobInfo,
+					sizeof(
+						jobInfo))) {
+				logger::error(
+					"SetInformationJobObject failed. Win32 error: {}",
+					GetLastError());
+
+				CloseHandle(
+					g_doomJob);
+
+				g_doomJob =
+					nullptr;
+
+				return false;
+			}
+		}
+
+		std::wstring commandLine;
+
+		commandLine +=
+			L"\"";
+
+		commandLine +=
+			DOOM_EXE_PATH;
+
+		commandLine +=
+			L"\" -iwad \"";
+
+		commandLine +=
+			DOOM_WAD_PATH;
+
+		commandLine +=
+			L"\"";
+
+		commandLine +=
+			L" -warp 1 1";
+
+		commandLine +=
+			L" -nomonsters";
+
+		commandLine +=
+			L" -nomusic";
+
+		commandLine +=
+			L" -nomouse";
+
+		commandLine +=
+			L" -window";
+
+		commandLine +=
+			L" -skydoomguest";
+
+		STARTUPINFOW
+		startupInfo{};
+
+		startupInfo.cb =
+			sizeof(
+				startupInfo);
+
+		startupInfo.dwFlags =
+			STARTF_USESHOWWINDOW;
+
+		startupInfo.wShowWindow =
+			SW_HIDE;
+
+		PROCESS_INFORMATION
+		processInfo{};
+
+		const DWORD creationFlags =
+			CREATE_SUSPENDED |
+			CREATE_NO_WINDOW;
+
+		if (
+			!CreateProcessW(
+				DOOM_EXE_PATH,
+				commandLine.data(),
+				nullptr,
+				nullptr,
+				FALSE,
+				creationFlags,
+				nullptr,
+				DOOM_WORKING_DIRECTORY,
+				&startupInfo,
+				&processInfo)) {
+			logger::error(
+				"CreateProcessW failed. Win32 error: {}",
+				GetLastError());
+
+			return false;
+		}
+
+		if (
+			!AssignProcessToJobObject(
+				g_doomJob,
+				processInfo.hProcess)) {
+			logger::error(
+				"AssignProcessToJobObject failed. Win32 error: {}",
+				GetLastError());
+
+			TerminateProcess(
+				processInfo.hProcess,
+				1);
+
+			CloseHandle(
+				processInfo.hThread);
+
+			CloseHandle(
+				processInfo.hProcess);
+
+			return false;
+		}
+
+		if (
+			ResumeThread(
+				processInfo.hThread) ==
+			static_cast<DWORD>(
+				-1)) {
+			logger::error(
+				"ResumeThread failed. Win32 error: {}",
+				GetLastError());
+
+			TerminateProcess(
+				processInfo.hProcess,
+				1);
+
+			CloseHandle(
+				processInfo.hThread);
+
+			CloseHandle(
+				processInfo.hProcess);
+
+			return false;
+		}
+
+		CloseHandle(
+			processInfo.hThread);
+
+		g_doomProcess =
+			processInfo.hProcess;
+
+		logger::info(
+			"Launched hidden DOOM guest. PID={}",
+			processInfo.dwProcessId);
+
+		return true;
+	}
+
+	// ========================================================
+	// COPY WEAPON FRAME FROM DOOM
+	// ========================================================
+
+	bool CopyLatestOverlay()
+	{
+		if (!g_state) {
+			return false;
+		}
+
+		auto& overlay =
+			g_state->overlay;
+
+		for (
+			int attempt = 0;
+			attempt < 4;
+			++attempt) {
+			const auto seq1 =
+				overlay.seq;
+
+			if (
+				seq1 & 1u) {
+				continue;
+			}
+
+			MemoryBarrier();
+
+			const auto width =
+				overlay.width;
+
+			const auto height =
+				overlay.height;
+
+			const auto frame =
+				overlay.frame_id;
+
+			if (
+				width !=
+					SKYDOOM_OVERLAY_WIDTH ||
+				height !=
+					SKYDOOM_OVERLAY_HEIGHT) {
+				return false;
+			}
+
+			std::memcpy(
+				g_overlayPixels.data(),
+				overlay.rgba,
+				SKYDOOM_OVERLAY_RGBA_BYTES);
+
+			MemoryBarrier();
+
+			const auto seq2 =
+				overlay.seq;
+
+			if (
+				seq1 == seq2 &&
+				!(seq2 & 1u)) {
+				if (
+					frame !=
+					g_lastOverlayFrame) {
+					g_lastOverlayFrame =
+						frame;
+
+					return true;
+				}
+
+				return false;
+			}
+		}
+
+		return false;
+	}
+
+	// ========================================================
+	// D3D11 SHADER COMPILATION
+	// ========================================================
+
+	bool CompileShader(
+		const char* source,
+		const char* entryPoint,
+		const char* target,
+		ID3DBlob**  output)
+	{
+		if (!output) {
+			return false;
+		}
+
+		ComPtr<ID3DBlob>
+			errors;
+
+		const HRESULT result =
+			D3DCompile(
+				source,
+				std::strlen(
+					source),
+				nullptr,
+				nullptr,
+				nullptr,
+				entryPoint,
+				target,
+				D3DCOMPILE_ENABLE_STRICTNESS |
+					D3DCOMPILE_OPTIMIZATION_LEVEL3,
+				0,
+				output,
+				&errors);
+
+		if (
+			FAILED(
+				result)) {
+			if (
+				errors) {
+				logger::error(
+					"SkyDoom shader compile error: {}",
+					static_cast<
+						const char*>(
+						errors->GetBufferPointer()));
+			}
+
+			return false;
+		}
+
+		return true;
+	}
+
+	// ========================================================
+	// CREATE D3D11 RESOURCES
+	// ========================================================
+
+	bool CreateOverlayResources()
+	{
+		if (
+			!g_device ||
+			!g_context) {
+			return false;
+		}
+
+		// ----------------------------------------------------
+		// Vertex shader
+		// ----------------------------------------------------
+
+		ComPtr<ID3DBlob>
+			vertexBlob;
+
+		if (
+			!CompileShader(
+				SKYDOOM_VERTEX_SHADER,
+				"main",
+				"vs_5_0",
+				&vertexBlob)) {
+			return false;
+		}
+
+		if (
+			FAILED(
+				g_device->CreateVertexShader(
+					vertexBlob->GetBufferPointer(),
+					vertexBlob->GetBufferSize(),
+					nullptr,
+					&g_vertexShader))) {
+			logger::error(
+				"CreateVertexShader failed");
+
+			return false;
+		}
+
+		// ----------------------------------------------------
+		// Input layout
+		// ----------------------------------------------------
+
+		D3D11_INPUT_ELEMENT_DESC
+		inputElements[] = {
+			{ "POSITION",
+				0,
+				DXGI_FORMAT_R32G32B32_FLOAT,
+				0,
+				0,
+				D3D11_INPUT_PER_VERTEX_DATA,
+				0 },
+
+			{ "TEXCOORD",
+				0,
+				DXGI_FORMAT_R32G32_FLOAT,
+				0,
+				12,
+				D3D11_INPUT_PER_VERTEX_DATA,
+				0 }
+		};
+
+		if (
+			FAILED(
+				g_device->CreateInputLayout(
+					inputElements,
+					2,
+					vertexBlob->GetBufferPointer(),
+					vertexBlob->GetBufferSize(),
+					&g_inputLayout))) {
+			logger::error(
+				"CreateInputLayout failed");
+
+			return false;
+		}
+
+		// ----------------------------------------------------
+		// Pixel shader
+		// ----------------------------------------------------
+
+		ComPtr<ID3DBlob>
+			pixelBlob;
+
+		if (
+			!CompileShader(
+				SKYDOOM_PIXEL_SHADER,
+				"main",
+				"ps_5_0",
+				&pixelBlob)) {
+			return false;
+		}
+
+		if (
+			FAILED(
+				g_device->CreatePixelShader(
+					pixelBlob->GetBufferPointer(),
+					pixelBlob->GetBufferSize(),
+					nullptr,
+					&g_pixelShader))) {
+			logger::error(
+				"CreatePixelShader failed");
+
+			return false;
+		}
+
+		// ----------------------------------------------------
+		// Dynamic weapon texture
+		// ----------------------------------------------------
+
+		D3D11_TEXTURE2D_DESC
+		textureDesc{};
+
+		textureDesc.Width =
+			SKYDOOM_OVERLAY_WIDTH;
+
+		textureDesc.Height =
+			SKYDOOM_OVERLAY_HEIGHT;
+
+		textureDesc.MipLevels =
+			1;
+
+		textureDesc.ArraySize =
+			1;
+
+		textureDesc.Format =
+			DXGI_FORMAT_R8G8B8A8_UNORM;
+
+		textureDesc.SampleDesc.Count =
+			1;
+
+		textureDesc.Usage =
+			D3D11_USAGE_DYNAMIC;
+
+		textureDesc.BindFlags =
+			D3D11_BIND_SHADER_RESOURCE;
+
+		textureDesc.CPUAccessFlags =
+			D3D11_CPU_ACCESS_WRITE;
+
+		if (
+			FAILED(
+				g_device->CreateTexture2D(
+					&textureDesc,
+					nullptr,
+					&g_overlayTexture))) {
+			logger::error(
+				"CreateTexture2D failed");
+
+			return false;
+		}
+
+		if (
+			FAILED(
+				g_device->CreateShaderResourceView(
+					g_overlayTexture.Get(),
+					nullptr,
+					&g_overlaySRV))) {
+			logger::error(
+				"CreateShaderResourceView failed");
+
+			return false;
+		}
+
+		// ----------------------------------------------------
+		// Dynamic vertex buffer
+		// ----------------------------------------------------
+
+		D3D11_BUFFER_DESC
+		vertexBufferDesc{};
+
+		vertexBufferDesc.ByteWidth =
+			static_cast<UINT>(
+				sizeof(
+					OverlayVertex) *
+				6);
+
+		vertexBufferDesc.Usage =
+			D3D11_USAGE_DYNAMIC;
+
+		vertexBufferDesc.BindFlags =
+			D3D11_BIND_VERTEX_BUFFER;
+
+		vertexBufferDesc.CPUAccessFlags =
+			D3D11_CPU_ACCESS_WRITE;
+
+		if (
+			FAILED(
+				g_device->CreateBuffer(
+					&vertexBufferDesc,
+					nullptr,
+					&g_vertexBuffer))) {
+			logger::error(
+				"CreateBuffer failed");
+
+			return false;
+		}
+
+		// ----------------------------------------------------
+		// Point sampler
+		// ----------------------------------------------------
+
+		D3D11_SAMPLER_DESC
+		samplerDesc{};
+
+		samplerDesc.Filter =
+			D3D11_FILTER_MIN_MAG_MIP_POINT;
+
+		samplerDesc.AddressU =
+			D3D11_TEXTURE_ADDRESS_CLAMP;
+
+		samplerDesc.AddressV =
+			D3D11_TEXTURE_ADDRESS_CLAMP;
+
+		samplerDesc.AddressW =
+			D3D11_TEXTURE_ADDRESS_CLAMP;
+
+		samplerDesc.MaxLOD =
+			D3D11_FLOAT32_MAX;
+
+		if (
+			FAILED(
+				g_device->CreateSamplerState(
+					&samplerDesc,
+					&g_pointSampler))) {
+			logger::error(
+				"CreateSamplerState failed");
+
+			return false;
+		}
+
+		// ----------------------------------------------------
+		// Straight-alpha blend
+		// ----------------------------------------------------
+
+		D3D11_BLEND_DESC
+		blendDesc{};
+
+		blendDesc.RenderTarget[0].BlendEnable =
+			TRUE;
+
+		blendDesc.RenderTarget[0].SrcBlend =
+			D3D11_BLEND_SRC_ALPHA;
+
+		blendDesc.RenderTarget[0].DestBlend =
+			D3D11_BLEND_INV_SRC_ALPHA;
+
+		blendDesc.RenderTarget[0].BlendOp =
+			D3D11_BLEND_OP_ADD;
+
+		blendDesc.RenderTarget[0].SrcBlendAlpha =
+			D3D11_BLEND_ONE;
+
+		blendDesc.RenderTarget[0].DestBlendAlpha =
+			D3D11_BLEND_INV_SRC_ALPHA;
+
+		blendDesc.RenderTarget[0].BlendOpAlpha =
+			D3D11_BLEND_OP_ADD;
+
+		blendDesc.RenderTarget[0].RenderTargetWriteMask =
+			D3D11_COLOR_WRITE_ENABLE_ALL;
+
+		if (
+			FAILED(
+				g_device->CreateBlendState(
+					&blendDesc,
+					&g_alphaBlend))) {
+			logger::error(
+				"CreateBlendState failed");
+
+			return false;
+		}
+
+		// ----------------------------------------------------
+		// Disable depth testing
+		// ----------------------------------------------------
+
+		D3D11_DEPTH_STENCIL_DESC
+		depthDesc{};
+
+		depthDesc.DepthEnable =
+			FALSE;
+
+		depthDesc.DepthWriteMask =
+			D3D11_DEPTH_WRITE_MASK_ZERO;
+
+		depthDesc.DepthFunc =
+			D3D11_COMPARISON_ALWAYS;
+
+		depthDesc.StencilEnable =
+			FALSE;
+
+		if (
+			FAILED(
+				g_device->CreateDepthStencilState(
+					&depthDesc,
+					&g_depthDisabled))) {
+			logger::error(
+				"CreateDepthStencilState failed");
+
+			return false;
+		}
+
+		// ----------------------------------------------------
+		// No culling
+		// ----------------------------------------------------
+
+		D3D11_RASTERIZER_DESC
+		rasterDesc{};
+
+		rasterDesc.FillMode =
+			D3D11_FILL_SOLID;
+
+		rasterDesc.CullMode =
+			D3D11_CULL_NONE;
+
+		rasterDesc.DepthClipEnable =
+			TRUE;
+
+		if (
+			FAILED(
+				g_device->CreateRasterizerState(
+					&rasterDesc,
+					&g_rasterizer))) {
+			logger::error(
+				"CreateRasterizerState failed");
+
+			return false;
+		}
+
+		logger::info(
+			"SkyDoom native D3D11 resources created");
+
+		return true;
+	}
+
+	bool InitializeOverlayGraphics(
+		IDXGISwapChain*
+			swapChain)
+	{
+		if (
+			g_device &&
+			g_context &&
+			g_vertexShader &&
+			g_pixelShader) {
+			return true;
+		}
+
+		if (!swapChain) {
+			return false;
+		}
+
+		ID3D11Device*
+			rawDevice =
+				nullptr;
+
+		const HRESULT deviceResult =
+			swapChain->GetDevice(
+				__uuidof(
+					ID3D11Device),
+				reinterpret_cast<
+					void**>(
+					&rawDevice));
+
+		if (
+			FAILED(
+				deviceResult) ||
+			!rawDevice) {
+			logger::error(
+				"Could not obtain Skyrim D3D11 device");
+
+			return false;
+		}
+
+		g_device.Attach(
+			rawDevice);
+
+		ID3D11DeviceContext*
+			rawContext =
+				nullptr;
+
+		g_device->GetImmediateContext(
+			&rawContext);
+
+		if (!rawContext) {
+			logger::error(
+				"Skyrim D3D11 immediate context is null");
+
+			return false;
+		}
+
+		g_context.Attach(
+			rawContext);
+
+		return CreateOverlayResources();
+	}
+
+	bool EnsureBackBufferRTV(
+		IDXGISwapChain*
+			swapChain)
+	{
+		if (
+			g_backBufferRTV) {
+			return true;
+		}
+
+		if (
+			!swapChain ||
+			!g_device) {
+			return false;
+		}
+
+		ComPtr<
+			ID3D11Texture2D>
+			backBuffer;
+
+		if (
+			FAILED(
+				swapChain->GetBuffer(
+					0,
+					IID_PPV_ARGS(
+						&backBuffer)))) {
+			logger::error(
+				"Could not obtain Skyrim back buffer");
+
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC
+		desc{};
+
+		backBuffer->GetDesc(
+			&desc);
+
+		g_backBufferWidth =
+			desc.Width;
+
+		g_backBufferHeight =
+			desc.Height;
+
+		if (
+			FAILED(
+				g_device->CreateRenderTargetView(
+					backBuffer.Get(),
+					nullptr,
+					&g_backBufferRTV))) {
+			logger::error(
+				"CreateRenderTargetView failed");
+
+			return false;
+		}
+
+		return true;
+	}
+
+	// ========================================================
+	// UPLOAD WEAPON RGBA
+	// ========================================================
+
+	void UploadOverlayTexture()
+	{
+		if (
+			!g_overlayTexture ||
+			!g_context) {
+			return;
+		}
+
+		D3D11_MAPPED_SUBRESOURCE
+		mapped{};
+
+		if (
+			FAILED(
+				g_context->Map(
+					g_overlayTexture.Get(),
+					0,
+					D3D11_MAP_WRITE_DISCARD,
+					0,
+					&mapped))) {
+			return;
+		}
+
+		for (
+			std::uint32_t y = 0;
+			y <
+			SKYDOOM_OVERLAY_HEIGHT;
+			++y) {
+			std::memcpy(
+				static_cast<
+					std::uint8_t*>(
+					mapped.pData) +
+					y *
+						mapped.RowPitch,
+
+				g_overlayPixels.data() +
+					y *
+						SKYDOOM_OVERLAY_WIDTH *
+						4,
+
+				SKYDOOM_OVERLAY_WIDTH *
+					4);
+		}
+
+		g_context->Unmap(
+			g_overlayTexture.Get(),
+			0);
+	}
+
+	// ========================================================
+	// BUILD FULL-SCREEN WEAPON QUAD
+	// ========================================================
+
+	bool UpdateWeaponVertices()
+	{
+		if (
+			!g_vertexBuffer ||
+			!g_context ||
+			g_backBufferWidth == 0 ||
+			g_backBufferHeight == 0) {
+			return false;
+		}
+
+		const float widthScale =
+			static_cast<float>(
+				g_backBufferWidth) /
+			static_cast<float>(
+				SKYDOOM_OVERLAY_WIDTH);
+
+		const float heightScale =
+			static_cast<float>(
+				g_backBufferHeight) /
+			static_cast<float>(
+				SKYDOOM_OVERLAY_HEIGHT);
+
+		const float scale =
+			widthScale <
+					heightScale ?
+				widthScale :
+				heightScale;
+
+		const float drawWidth =
+			static_cast<float>(
+				SKYDOOM_OVERLAY_WIDTH) *
+			scale;
+
+		const float drawHeight =
+			static_cast<float>(
+				SKYDOOM_OVERLAY_HEIGHT) *
+			scale;
+
+		const float leftPixels =
+			(static_cast<float>(
+				 g_backBufferWidth) -
+				drawWidth) *
+			0.5f;
+
+		const float topPixels =
+			static_cast<float>(
+				g_backBufferHeight) -
+			drawHeight;
+
+		const float rightPixels =
+			leftPixels +
+			drawWidth;
+
+		const float bottomPixels =
+			topPixels +
+			drawHeight;
+
+		const float left =
+			(leftPixels /
+				static_cast<float>(
+					g_backBufferWidth)) *
+				2.0f -
+			1.0f;
+
+		const float right =
+			(rightPixels /
+				static_cast<float>(
+					g_backBufferWidth)) *
+				2.0f -
+			1.0f;
+
+		const float top =
+			1.0f -
+			(topPixels /
+				static_cast<float>(
+					g_backBufferHeight)) *
+				2.0f;
+
+		const float bottom =
+			1.0f -
+			(bottomPixels /
+				static_cast<float>(
+					g_backBufferHeight)) *
+				2.0f;
+
+		const OverlayVertex vertices[6] = {
+			{ left,
+				top,
+				0.0f,
+				0.0f,
+				0.0f },
+
+			{ right,
+				top,
+				0.0f,
+				1.0f,
+				0.0f },
+
+			{ right,
+				bottom,
+				0.0f,
+				1.0f,
+				1.0f },
+
+			{ left,
+				top,
+				0.0f,
+				0.0f,
+				0.0f },
+
+			{ right,
+				bottom,
+				0.0f,
+				1.0f,
+				1.0f },
+
+			{ left,
+				bottom,
+				0.0f,
+				0.0f,
+				1.0f }
+		};
+
+		D3D11_MAPPED_SUBRESOURCE
+		mapped{};
+
+		if (
+			FAILED(
+				g_context->Map(
+					g_vertexBuffer.Get(),
+					0,
+					D3D11_MAP_WRITE_DISCARD,
+					0,
+					&mapped))) {
+			return false;
+		}
+
+		std::memcpy(
+			mapped.pData,
+			vertices,
+			sizeof(
+				vertices));
+
+		g_context->Unmap(
+			g_vertexBuffer.Get(),
+			0);
+
+		return true;
+	}
+
+	// ========================================================
+	// DRAW SKYDOOM WEAPON
+	// ========================================================
+
+	void RenderSkyDoomOverlay(
+		IDXGISwapChain*
+			swapChain)
+	{
+		if (
+			!g_state ||
+			!g_state->skyrim.in_game ||
+			g_state->skyrim.paused ||
+			!DoomHeartbeatIsFresh()) {
+			return;
+		}
+
+		if (
+			!InitializeOverlayGraphics(
+				swapChain)) {
+			return;
+		}
+
+		if (
+			!EnsureBackBufferRTV(
+				swapChain)) {
+			return;
+		}
+
+		if (
+			CopyLatestOverlay()) {
+			UploadOverlayTexture();
+		}
+
+		if (
+			g_lastOverlayFrame == 0 ||
+			!g_overlaySRV) {
+			return;
+		}
+
+		if (
+			!UpdateWeaponVertices()) {
+			return;
+		}
+
+		g_context->OMSetRenderTargets(
+			1,
+			g_backBufferRTV.GetAddressOf(),
+			nullptr);
+
+		D3D11_VIEWPORT viewport{};
+
+		viewport.TopLeftX =
+			0.0f;
+
+		viewport.TopLeftY =
+			0.0f;
+
+		viewport.Width =
+			static_cast<float>(
+				g_backBufferWidth);
+
+		viewport.Height =
+			static_cast<float>(
+				g_backBufferHeight);
+
+		viewport.MinDepth =
+			0.0f;
+
+		viewport.MaxDepth =
+			1.0f;
+
+		g_context->RSSetViewports(
+			1,
+			&viewport);
+
+		g_context->RSSetState(
+			g_rasterizer.Get());
+
+		const UINT stride =
+			sizeof(
+				OverlayVertex);
+
+		const UINT offset =
+			0;
+
+		ID3D11Buffer*
+			vertexBuffers[] = {
+				g_vertexBuffer.Get()
+			};
+
+		g_context->IASetVertexBuffers(
+			0,
+			1,
+			vertexBuffers,
+			&stride,
+			&offset);
+
+		g_context->IASetInputLayout(
+			g_inputLayout.Get());
+
+		g_context->IASetPrimitiveTopology(
+			D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+		g_context->VSSetShader(
+			g_vertexShader.Get(),
+			nullptr,
+			0);
+
+		g_context->PSSetShader(
+			g_pixelShader.Get(),
+			nullptr,
+			0);
+
+		ID3D11ShaderResourceView*
+			srvs[] = {
+				g_overlaySRV.Get()
+			};
+
+		g_context->PSSetShaderResources(
+			0,
+			1,
+			srvs);
+
+		ID3D11SamplerState*
+			samplers[] = {
+				g_pointSampler.Get()
+			};
+
+		g_context->PSSetSamplers(
+			0,
+			1,
+			samplers);
+
+		const float blendFactor[4] = {
+			0.0f,
+			0.0f,
+			0.0f,
+			0.0f
+		};
+
+		g_context->OMSetBlendState(
+			g_alphaBlend.Get(),
+			blendFactor,
+			0xFFFFFFFFu);
+
+		g_context->OMSetDepthStencilState(
+			g_depthDisabled.Get(),
+			0);
+
+		g_context->Draw(
+			6,
+			0);
+
+		/*
+            Unbind the SRV afterwards.
+
+            This avoids accidental resource hazards if Skyrim
+            later reuses the same slots.
+        */
+
+		ID3D11ShaderResourceView*
+			nullSRV =
+				nullptr;
+
+		g_context->PSSetShaderResources(
+			0,
+			1,
+			&nullSRV);
+	}
+
+    // ========================================================
+    // PHYSICAL MOUSE -> DOOM FIRE
+    // ========================================================
+
+    bool SkyDoomHasForegroundFocus()
+    {
+        const HWND foregroundWindow =
+            GetForegroundWindow();
+
+
+        if (!foregroundWindow)
+        {
+            return false;
+        }
+
+
+        DWORD foregroundProcess =
+            0;
+
+
+        GetWindowThreadProcessId(
+            foregroundWindow,
+            &foregroundProcess
+        );
+
+
+        return
+            foregroundProcess ==
+            GetCurrentProcessId();
+    }
+
+
+    void PollPhysicalDoomFire()
+    {
+        if (!g_state)
+        {
+            return;
+        }
+
+
+        const bool active =
+            g_state->
+                skyrim.
+                in_game &&
+            !g_state->
+                skyrim.
+                paused &&
+            DoomHeartbeatIsFresh() &&
+            SkyDoomHasForegroundFocus();
+
+
+        bool physicalDown =
+            false;
+
+
+        if (active)
+        {
+            physicalDown =
+                (
+                    GetAsyncKeyState(
+                        VK_LBUTTON
+                    ) &
+                    0x8000
+                ) != 0;
+        }
+
+
+        /*
+            Only publish transitions.
+
+            DOWN:
+                Skyrim physical LMB -> DOOM FIRE = 1
+
+            UP:
+                Skyrim physical LMB -> DOOM FIRE = 0
+
+            Chocolate Doom already has our action pulse,
+            so even a fast click becomes a valid DOOM shot.
+        */
+
+        if (
+            physicalDown ==
+            g_physicalFireDown
+        )
+        {
+            return;
+        }
+
+
+        g_physicalFireDown =
+            physicalDown;
+
+
+        PushInputEvent(
+            SKYDOOM_INPUT_EVENT_BUTTON,
+            SKYDOOM_INPUT_FIRE,
+            physicalDown ?
+                1 :
+                0
+        );
+    }
+
+	// ========================================================
+	// SWAP CHAIN HOOKS
+	// ========================================================
+
+	HRESULT __stdcall HookPresent(
+		IDXGISwapChain*
+			 swapChain,
+		UINT syncInterval,
+		UINT flags)
+	{
+        // SKYDOOM_POLL_PHYSICAL_LMB_V4
+        PollPhysicalDoomFire();
+
+		RenderSkyDoomOverlay(
+			swapChain);
+
+		return g_originalPresent(
+			swapChain,
+			syncInterval,
+			flags);
+	}
+
+	HRESULT __stdcall HookResizeBuffers(
+		IDXGISwapChain*
+					swapChain,
+		UINT        bufferCount,
+		UINT        width,
+		UINT        height,
+		DXGI_FORMAT newFormat,
+		UINT        swapChainFlags)
+	{
+		g_backBufferRTV.Reset();
+
+		g_backBufferWidth =
+			0;
+
+		g_backBufferHeight =
+			0;
+
+		return g_originalResizeBuffers(
+			swapChain,
+			bufferCount,
+			width,
+			height,
+			newFormat,
+			swapChainFlags);
+	}
+
+	bool PatchVTableEntry(
+		void** entry,
+		void*  replacement,
+		void** original)
+	{
+		DWORD oldProtect =
+			0;
+
+		if (
+			!VirtualProtect(
+				entry,
+				sizeof(
+					void*),
+				PAGE_EXECUTE_READWRITE,
+				&oldProtect)) {
+			return false;
+		}
+
+		*original =
+			*entry;
+
+		*entry =
+			replacement;
+
+		DWORD ignored =
+			0;
+
+		VirtualProtect(
+			entry,
+			sizeof(
+				void*),
+			oldProtect,
+			&ignored);
+
+		FlushInstructionCache(
+			GetCurrentProcess(),
+			entry,
+			sizeof(
+				void*));
+
+		return true;
+	}
+
+	bool InstallRenderHook()
+	{
+		if (
+			g_renderHookInstalled) {
+			return true;
+		}
+
+		auto* renderWindow =
+			RE::BSGraphics::
+				Renderer::
+					GetCurrentRenderWindow();
+
+		if (!renderWindow) {
+			logger::error(
+				"CommonLib returned no current Skyrim render window");
+
+			return false;
+		}
+
+		if (
+			!renderWindow->swapChain) {
+			logger::error(
+				"Current Skyrim render window has no swap chain");
+
+			return false;
+		}
+
+		auto* swapChain =
+			reinterpret_cast<
+				IDXGISwapChain*>(
+				renderWindow->swapChain);
+
+		auto** vtable =
+			*reinterpret_cast<
+				void***>(
+				swapChain);
+
+		if (!vtable) {
+			logger::error(
+				"Skyrim swap-chain vtable was null");
+
+			return false;
+		}
+
+		void* originalPresent =
+			nullptr;
+
+		void* originalResize =
+			nullptr;
+
+		if (
+			!PatchVTableEntry(
+				&vtable[8],
+				reinterpret_cast<
+					void*>(
+					&HookPresent),
+				&originalPresent)) {
+			logger::error(
+				"Could not hook IDXGISwapChain::Present");
+
+			return false;
+		}
+
+		if (
+			!PatchVTableEntry(
+				&vtable[13],
+				reinterpret_cast<
+					void*>(
+					&HookResizeBuffers),
+				&originalResize)) {
+			logger::error(
+				"Could not hook IDXGISwapChain::ResizeBuffers");
+
+			return false;
+		}
+
+		g_originalPresent =
+			reinterpret_cast<
+				PresentFn>(
+				originalPresent);
+
+		g_originalResizeBuffers =
+			reinterpret_cast<
+				ResizeBuffersFn>(
+				originalResize);
+
+		g_renderHookInstalled =
+			true;
+
+		logger::info(
+			"SkyDoom native D3D11 overlay hook installed");
+
+		return true;
+	}
+
+	// ========================================================
+	// SKYRIM STATE
+	// ========================================================
+
+    // ========================================================
+    // SKYDOOM FIRST-PERSON PRESENTATION
+    // ========================================================
+
+    // SKYDOOM_PRESENTATION_V4_BEGIN
+
+    void ApplySkyDoomPresentation(
+        bool active
+    )
+    {
+        /*
+            SkyDoom owns first-person combat while active.
+
+            Disable Skyrim's fighting controls temporarily so
+            it does not punch, swing weapons or block.
+
+            The third ToggleControls argument is FALSE because
+            this must NOT alter Skyrim's stored control state.
+        */
+
+        auto* controlMap =
+            RE::ControlMap::
+                GetSingleton();
+
+
+        if (controlMap)
+        {
+            using UEFlag =
+                RE::ControlMap::
+                    UEFlag;
+
+
+            if (active)
+            {
+                if (
+                    controlMap->
+                        IsFightingControlsEnabled()
+                )
+                {
+                    controlMap->
+                        ToggleControls(
+                            UEFlag::kFighting,
+                            false,
+                            false
+                        );
+
+
+                    g_skyDoomDisabledFightingControls =
+                        true;
+                }
+            }
+            else if (
+                g_skyDoomDisabledFightingControls
+            )
+            {
+                controlMap->
+                    ToggleControls(
+                        UEFlag::kFighting,
+                        true,
+                        false
+                    );
+
+
+                g_skyDoomDisabledFightingControls =
+                    false;
+            }
+        }
+
+
+        /*
+            Hide Skyrim's first-person player model.
+
+            This removes the fists / hands / Skyrim weapon.
+
+            The DOOM weapon is drawn separately by SkyDoom's
+            D3D11 overlay, so it remains visible.
+        */
+
+        auto* player =
+            RE::PlayerCharacter::
+                GetSingleton();
+
+
+        if (!player)
+        {
+            return;
+        }
+
+
+        auto* firstPerson =
+            player->
+                Get3D(
+                    true
+                );
+
+
+        if (!firstPerson)
+        {
+            return;
+        }
+
+
+        if (active)
+        {
+            /*
+                Repeat the cull while active because Skyrim can
+                rebuild its first-person model after animation,
+                equipment or camera changes.
+            */
+
+            firstPerson->
+                CullNode(
+                    true
+                );
+
+
+            g_skyDoomCulledFirstPerson =
+                true;
+        }
+        else if (
+            g_skyDoomCulledFirstPerson
+        )
+        {
+            firstPerson->
+                CullNode(
+                    false
+                );
+
+
+            g_skyDoomCulledFirstPerson =
+                false;
+        }
+    }
+
+    // SKYDOOM_PRESENTATION_V4_END
+
+
+    // ========================================================
+    // DOOM PISTOL -> SKYRIM ACTOR DAMAGE
+    // ========================================================
+
+    void ResetDoomCombatSnapshot()
+    {
+        g_haveDoomCombatSnapshot =
+            false;
+
+        g_lastDoomBullets =
+            0;
+
+        g_lastDoomWeapon =
+            -1;
+
+        g_lastDoomCombatTick =
+            0;
+    }
+
+
+
+    void ApplyDoomPistolDamageToCrosshairActor(
+        std::int32_t shotCount
+    )
+    {
+        // SKYDOOM_ACTOR_HITBOX_V4
+
+        /*
+            A real Chocolate Doom pistol shot has already been
+            confirmed by ammo consumption before this function
+            is called.
+
+            Target selection here deliberately follows the same
+            broad architecture SkyCraft uses for Skyrim NPCs:
+
+              Skyrim ProcessLists
+                  ->
+              highActorHandles
+                  ->
+              real Actor position / height / radius
+
+            We do NOT use CrosshairPickData, bhkWorld::PickObject
+            or TES::Pick here.
+
+            Instead we cast the centre-camera ray mathematically
+            against each nearby Skyrim Actor's bounds and select
+            the nearest intersected Actor.
+        */
+
+        if (shotCount <= 0)
+        {
+            return;
+        }
+
+
+        auto* player =
+            RE::PlayerCharacter::
+                GetSingleton();
+
+
+        if (!player)
+        {
+            return;
+        }
+
+
+        auto* camera =
+            RE::PlayerCamera::
+                GetSingleton();
+
+
+        if (
+            !camera ||
+            !camera->
+                cameraRoot
+        )
+        {
+            return;
+        }
+
+
+        /*
+            The DOOM weapon sprite is centred on screen.
+
+            Therefore the Skyrim camera's forward vector is our
+            hitscan direction.
+        */
+
+        const RE::NiPoint3
+            rayOrigin =
+                RE::PlayerCamera::
+                    GetActiveCameraPosition();
+
+
+        RE::NiPoint3 rayDirection =
+            camera->
+                cameraRoot->
+                world.
+                rotate *
+            RE::NiPoint3{
+                0.0f,
+                1.0f,
+                0.0f
+            };
+
+
+        if (
+            rayDirection.
+                Unitize() <=
+            0.0f
+        )
+        {
+            return;
+        }
+
+
+        auto* processLists =
+            RE::ProcessLists::
+                GetSingleton();
+
+
+        if (!processLists)
+        {
+            return;
+        }
+
+
+        RE::Actor*
+            nearestActor =
+                nullptr;
+
+
+        float nearestDistance =
+            SKYDOOM_PISTOL_HITSCAN_RANGE +
+            1.0f;
+
+
+        std::uint32_t
+            testedActors =
+                0;
+
+
+        /*
+            Ray versus axis-aligned Actor bounds.
+
+            Skyrim's Actor::GetPosition() is treated as the feet
+            position, matching the way SkyCraft exports Actors.
+
+            Width is based on GetBoundRadius()*2.
+            Height is based on GetHeight().
+
+            The dimensions are constrained to the same broad
+            ranges SkyCraft uses for its NPC proxy dimensions:
+
+              height: 21 .. 840 Skyrim units
+              width : 21 .. 420 Skyrim units
+        */
+
+        for (
+            auto& handle :
+                processLists->
+                    highActorHandles
+        )
+        {
+            auto actorPtr =
+                handle.
+                    get();
+
+
+            auto* actor =
+                actorPtr.
+                    get();
+
+
+            if (
+                !actor ||
+                actor == player ||
+                actor->
+                    IsDisabled() ||
+                !actor->
+                    Is3DLoaded() ||
+                actor->
+                    IsGhost() ||
+                actor->
+                    IsDead()
+            )
+            {
+                continue;
+            }
+
+
+            ++testedActors;
+
+
+            const RE::NiPoint3
+                actorPosition =
+                    actor->
+                        GetPosition();
+
+
+            /*
+                Reject Actors that cannot possibly be within the
+                pistol's maximum distance before doing the more
+                expensive slab intersection.
+
+                Include their dimensions in the allowance so
+                large creatures near the range boundary remain
+                hittable.
+            */
+
+            const float
+                dx =
+                    actorPosition.x -
+                    rayOrigin.x;
+
+
+            const float
+                dy =
+                    actorPosition.y -
+                    rayOrigin.y;
+
+
+            const float
+                dz =
+                    actorPosition.z -
+                    rayOrigin.z;
+
+
+            const float
+                roughDistanceSquared =
+                    dx * dx +
+                    dy * dy +
+                    dz * dz;
+
+
+            const float
+                maxCandidateDistance =
+                    SKYDOOM_PISTOL_HITSCAN_RANGE +
+                    900.0f;
+
+
+            if (
+                roughDistanceSquared >
+                maxCandidateDistance *
+                    maxCandidateDistance
+            )
+            {
+                continue;
+            }
+
+
+            float actorHeight =
+                actor->
+                    GetHeight();
+
+
+            if (actorHeight < 21.0f)
+            {
+                actorHeight =
+                    21.0f;
+            }
+
+
+            if (actorHeight > 840.0f)
+            {
+                actorHeight =
+                    840.0f;
+            }
+
+
+            float actorWidth =
+                actor->
+                    GetBoundRadius() *
+                2.0f;
+
+
+            if (actorWidth < 21.0f)
+            {
+                actorWidth =
+                    21.0f;
+            }
+
+
+            if (actorWidth > 420.0f)
+            {
+                actorWidth =
+                    420.0f;
+            }
+
+
+            /*
+                A tiny amount of extra width makes the pistol
+                feel like a normal game hitscan rather than a
+                mathematically perfect one-pixel laser.
+
+                This is only 4 Skyrim units on each side.
+            */
+
+            const float actorRadius =
+                actorWidth *
+                    0.5f +
+                4.0f;
+
+
+            const float minX =
+                actorPosition.x -
+                actorRadius;
+
+
+            const float maxX =
+                actorPosition.x +
+                actorRadius;
+
+
+            const float minY =
+                actorPosition.y -
+                actorRadius;
+
+
+            const float maxY =
+                actorPosition.y +
+                actorRadius;
+
+
+            /*
+                ActorPosition is the feet position.
+
+                Give the bottom a small allowance because actors
+                can visually sink slightly into terrain.
+            */
+
+            const float minZ =
+                actorPosition.z -
+                4.0f;
+
+
+            const float maxZ =
+                actorPosition.z +
+                actorHeight;
+
+
+            float tMin =
+                0.0f;
+
+
+            float tMax =
+                SKYDOOM_PISTOL_HITSCAN_RANGE;
+
+
+            /*
+                Standard ray/AABB slab test.
+
+                Keeping it inline avoids introducing another
+                helper or changing any other part of Plugin.cpp.
+            */
+
+            auto intersectSlab =
+                [&tMin, &tMax](
+                    float origin,
+                    float direction,
+                    float slabMin,
+                    float slabMax
+                ) -> bool
+                {
+                    if (
+                        direction >
+                            -0.000001f &&
+                        direction <
+                            0.000001f
+                    )
+                    {
+                        return
+                            origin >= slabMin &&
+                            origin <= slabMax;
+                    }
+
+
+                    const float inverseDirection =
+                        1.0f /
+                        direction;
+
+
+                    float t1 =
+                        (
+                            slabMin -
+                            origin
+                        ) *
+                        inverseDirection;
+
+
+                    float t2 =
+                        (
+                            slabMax -
+                            origin
+                        ) *
+                        inverseDirection;
+
+
+                    if (t1 > t2)
+                    {
+                        const float swap =
+                            t1;
+
+                        t1 =
+                            t2;
+
+                        t2 =
+                            swap;
+                    }
+
+
+                    if (t1 > tMin)
+                    {
+                        tMin =
+                            t1;
+                    }
+
+
+                    if (t2 < tMax)
+                    {
+                        tMax =
+                            t2;
+                    }
+
+
+                    return
+                        tMax >=
+                        tMin;
+                };
+
+
+            if (
+                !intersectSlab(
+                    rayOrigin.x,
+                    rayDirection.x,
+                    minX,
+                    maxX
+                ) ||
+                !intersectSlab(
+                    rayOrigin.y,
+                    rayDirection.y,
+                    minY,
+                    maxY
+                ) ||
+                !intersectSlab(
+                    rayOrigin.z,
+                    rayDirection.z,
+                    minZ,
+                    maxZ
+                )
+            )
+            {
+                continue;
+            }
+
+
+            if (
+                tMax <
+                    0.0f
+            )
+            {
+                continue;
+            }
+
+
+            float hitDistance =
+                tMin;
+
+
+            /*
+                Point-blank case: camera can technically begin
+                inside a large creature's bounds.
+            */
+
+            if (hitDistance < 0.0f)
+            {
+                hitDistance =
+                    0.0f;
+            }
+
+
+            if (
+                hitDistance >
+                    SKYDOOM_PISTOL_HITSCAN_RANGE ||
+                hitDistance >=
+                    nearestDistance
+            )
+            {
+                continue;
+            }
+
+
+            nearestDistance =
+                hitDistance;
+
+
+            nearestActor =
+                actor;
+        }
+
+
+        if (!nearestActor)
+        {
+            SKSE::log::info(
+                "[skydoomskse] DOOM pistol actor hitscan: MISS candidates={}",
+                testedActors
+            );
+
+            return;
+        }
+
+
+        // SKYDOOM_STRICT_GEOMETRY_OCCLUSION_V4
+
+        /*
+            Actor targeting has ALREADY succeeded.
+
+            nearestActor and nearestDistance come from our
+            known-good mathematical Actor-hitbox system.
+
+            Havok is used here ONLY to answer:
+
+                "Is solid Skyrim geometry between the camera
+                 and the Actor we already selected?"
+
+            Havok is NOT responsible for selecting the NPC.
+        */
+
+        auto* occlusionController =
+            player->
+                GetCharController();
+
+
+        if (occlusionController)
+        {
+            auto* occlusionWorld =
+                occlusionController->
+                    GetHavokWorld();
+
+
+            if (occlusionWorld)
+            {
+                /*
+                    Start slightly in front of the camera to
+                    avoid the player's own controller.
+
+                    For very close targets, shorten this
+                    automatically.
+                */
+
+                float occlusionStartDistance =
+                    nearestDistance *
+                    0.25f;
+
+
+                if (occlusionStartDistance > 48.0f)
+                {
+                    occlusionStartDistance =
+                        48.0f;
+                }
+
+
+                if (occlusionStartDistance < 4.0f)
+                {
+                    occlusionStartDistance =
+                        4.0f;
+                }
+
+
+                /*
+                    Stop slightly before the mathematical Actor
+                    hitbox so the target itself should not count
+                    as scenery.
+                */
+
+                const float occlusionEndDistance =
+                    nearestDistance -
+                    8.0f;
+
+
+                if (
+                    occlusionEndDistance >
+                    occlusionStartDistance
+                )
+                {
+                    const RE::NiPoint3
+                        occlusionStartWorld =
+                            rayOrigin +
+                            rayDirection *
+                                occlusionStartDistance;
+
+
+                    const RE::NiPoint3
+                        occlusionEndWorld =
+                            rayOrigin +
+                            rayDirection *
+                                occlusionEndDistance;
+
+
+                    /*
+                        Convert Bethesda-world coordinates into
+                        the active Havok world's coordinate
+                        frame using the player's controller as
+                        the origin anchor.
+                    */
+
+                    const RE::NiPoint3
+                        playerWorld =
+                            player->
+                                GetPosition();
+
+
+                    RE::hkVector4
+                        playerHavok{};
+
+
+                    occlusionController->
+                        GetPosition(
+                            playerHavok,
+                            false
+                        );
+
+                    // SKYDOOM_HAVOK_GROUND_PROBE_V4
+
+                    /*
+                        DIAGNOSTIC ONLY.
+
+                        Test bhkWorld::PickObject using the
+                        player's native Havok position directly.
+
+                        There is NO camera conversion here.
+
+                        Start:
+                            exact character-controller Havok
+                            position
+
+                        End:
+                            2 Havok units directly downward
+                            (~140 Skyrim world units)
+
+                        If this cannot hit the floor, our
+                        camera-ray maths is NOT the problem:
+                        PickObject itself is failing in this
+                        execution context.
+
+                        If this DOES hit the floor, PickObject
+                        works and our camera->Havok conversion
+                        becomes the prime suspect.
+                    */
+
+                    RE::bhkPickData
+                        groundProbe{};
+
+
+                    groundProbe.
+                        rayInput.
+                        enableShapeCollectionFilter =
+                            true;
+
+
+                    groundProbe.
+                        rayInput.
+                        from =
+                            playerHavok;
+
+
+                    groundProbe.
+                        rayInput.
+                        to =
+                            playerHavok +
+                            RE::hkVector4{
+                                0.0f,
+                                0.0f,
+                                -2.0f,
+                                0.0f
+                            };
+
+
+                    /*
+                        Use Skyrim's real character-controller
+                        filter completely unchanged.
+                    */
+
+                    occlusionController->
+                        GetCollisionFilterInfo(
+                            groundProbe.
+                                rayInput.
+                                filterInfo
+                        );
+
+
+                    /*
+                        Deliberately DO NOT populate
+                        groundProbe.ray.
+
+                        Known working CommonLib Skyrim code
+                        supplies from/to/filterInfo directly to
+                        PickObject in this fashion.
+                    */
+
+                    const bool groundProbeResult =
+                        occlusionWorld->
+                            PickObject(
+                                groundProbe
+                            );
+
+
+                    const bool groundProbeCollidable =
+                        groundProbe.
+                            rayOutput.
+                            rootCollidable !=
+                        nullptr;
+
+
+                    SKSE::log::info(
+                        "[skydoomskse] HAVOK GROUND PROBE: result={} collidable={} fraction={} filter=0x{:08X}",
+                        groundProbeResult,
+                        groundProbeCollidable,
+                        groundProbe.
+                            rayOutput.
+                            hitFraction,
+                        groundProbe.
+                            rayInput.
+                            filterInfo.
+                            filter
+                    );
+
+
+
+
+                    const RE::NiPoint3
+                        startDeltaWorld{
+                            occlusionStartWorld.x -
+                                playerWorld.x,
+
+                            occlusionStartWorld.y -
+                                playerWorld.y,
+
+                            occlusionStartWorld.z -
+                                playerWorld.z
+                        };
+
+
+                    const RE::NiPoint3
+                        endDeltaWorld{
+                            occlusionEndWorld.x -
+                                playerWorld.x,
+
+                            occlusionEndWorld.y -
+                                playerWorld.y,
+
+                            occlusionEndWorld.z -
+                                playerWorld.z
+                        };
+
+
+                                        // SKYDOOM_WORLD_SCALE_FIX_V4
+                    /*
+                        IMPORTANT:
+
+                        Bethesda world-space -> Havok-space uses
+                        bhkWorld::GetWorldScale().
+
+                        GetWorldScaleInverse() converts in the
+                        opposite direction and was making our
+                        camera scenery ray vastly mis-scaled.
+
+                        Keep the existing player-Havok anchor
+                        so shifted Havok world origins continue
+                        to be handled correctly.
+                    */
+
+                    const float havokScale =
+                        RE::bhkWorld::
+                            GetWorldScale();
+
+
+                    const RE::hkVector4
+                        havokScaleVector{
+                            havokScale
+                        };
+
+                    SKSE::log::info(
+                        "[skydoomskse] HAVOK SCALE CHECK: worldScale={} inverse={}",
+                        RE::bhkWorld::
+                            GetWorldScale(),
+                        RE::bhkWorld::
+                            GetWorldScaleInverse()
+                    );
+
+
+                    const RE::hkVector4
+                        occlusionStartHavok =
+                            playerHavok +
+                            (
+                                RE::hkVector4(
+                                    startDeltaWorld
+                                ) *
+                                havokScaleVector
+                            );
+
+
+                    const RE::hkVector4
+                        occlusionEndHavok =
+                            playerHavok +
+                            (
+                                RE::hkVector4(
+                                    endDeltaWorld
+                                ) *
+                                havokScaleVector
+                            );
+
+
+                    RE::bhkPickData
+                        occlusionPick{};
+
+
+                    occlusionPick.
+                        rayInput.
+                        enableShapeCollectionFilter =
+                            true;
+
+
+                    occlusionPick.
+                        rayInput.
+                        from =
+                            occlusionStartHavok;
+
+
+                    occlusionPick.
+                        rayInput.
+                        to =
+                            occlusionEndHavok;
+
+
+                    /*
+                        Start from the player's actual collision
+                        filter so Skyrim's current system-group
+                        information is retained.
+                    */
+
+                    occlusionController->
+                        GetCollisionFilterInfo(
+                            occlusionPick.
+                                rayInput.
+                                filterInfo
+                        );
+
+
+                    /*
+                        Then change only the collision layer used
+                        for the scenery query.
+                    */
+
+                                        // SKYDOOM_CONTROLLER_FILTER_OCCLUSION_V4
+                    /*
+                        IMPORTANT:
+
+                        Keep the collision filter returned by the
+                        player's bhkCharacterController exactly
+                        as Skyrim supplied it.
+
+                        Do NOT replace its collision layer.
+
+                        The controller's real filter already
+                        contains the layer/system-group data used
+                        to collide with solid Skyrim world
+                        geometry.
+                    */
+
+
+                    /*
+                        bhkPickData contains an explicit direction
+                        vector as well as the input endpoints.
+                    */
+
+                    // SKYDOOM_NO_MANUAL_PICK_RAY_V4
+                    /*
+                        Do NOT populate occlusionPick.ray here.
+
+                        Our successful native-Havok ground probe,
+                        and known working Skyrim/CommonLib
+                        PickObject usage, populate only:
+
+                            rayInput.from
+                            rayInput.to
+                            rayInput.filterInfo
+
+                        Let bhkWorld::PickObject handle the rest.
+                    */
+
+
+                    const bool occlusionHit =
+                        occlusionWorld->
+                            PickObject(
+                                occlusionPick
+                            );
+
+
+                    if (
+                        occlusionHit &&
+                        occlusionPick.
+                            rayOutput.
+                            rootCollidable
+                    )
+                    {
+                        auto* blockerRef =
+                            RE::TESHavokUtilities::
+                                FindCollidableRef(
+                                    *occlusionPick.
+                                        rayOutput.
+                                        rootCollidable
+                                );
+
+
+                        /*
+                            Do not let the selected target's own
+                            physics body count as scenery.
+                        */
+
+                        if (
+                            blockerRef !=
+                            nearestActor
+                        )
+                        {
+                            const float rayLength =
+                                occlusionEndDistance -
+                                occlusionStartDistance;
+
+
+                            const float blockerDistance =
+                                occlusionStartDistance +
+                                (
+                                    occlusionPick.
+                                        rayOutput.
+                                        hitFraction *
+                                    rayLength
+                                );
+
+
+                            if (blockerRef)
+                            {
+                                SKSE::log::info(
+                                    "[skydoomskse] DOOM pistol geometry BLOCKED: target={:08X} blocker={:08X} blockerDistance={} targetDistance={}",
+                                    nearestActor->
+                                        GetFormID(),
+                                    blockerRef->
+                                        GetFormID(),
+                                    blockerDistance,
+                                    nearestDistance
+                                );
+                            }
+                            else
+                            {
+                                /*
+                                    Static architecture and
+                                    terrain can have collision
+                                    without a normal TESObjectREFR.
+
+                                    It still blocks the bullet.
+                                */
+
+                                SKSE::log::info(
+                                    "[skydoomskse] DOOM pistol geometry BLOCKED: target={:08X} blocker=STATIC blockerDistance={} targetDistance={}",
+                                    nearestActor->
+                                        GetFormID(),
+                                    blockerDistance,
+                                    nearestDistance
+                                );
+                            }
+
+
+                            return;
+                        }
+                    }
+
+
+                                        SKSE::log::info(
+                        "[skydoomskse] DOOM pistol geometry CLEAR: target={:08X} distance={} filter=0x{:08X}",
+                        nearestActor->
+                            GetFormID(),
+                        nearestDistance,
+                        occlusionPick.
+                            rayInput.
+                            filterInfo.
+                            filter
+                    );
+                }
+            }
+        }
+
+        auto* actorValueOwner =
+            nearestActor->
+                AsActorValueOwner();
+
+
+        if (!actorValueOwner)
+        {
+            return;
+        }
+
+
+        const float healthBefore =
+            actorValueOwner->
+                GetActorValue(
+                    RE::ActorValue::
+                        kHealth
+                );
+
+
+        if (healthBefore <= 0.0f)
+        {
+            return;
+        }
+
+
+        const float damage =
+            SKYDOOM_PISTOL_TEST_DAMAGE *
+            static_cast<float>(
+                shotCount
+            );
+
+
+        /*
+            SkyCraft uses Skyrim's HitData pipeline when
+            available and falls back to Actor::DoDamage().
+
+            For this SkyDoom milestone we use that reliable
+            native fallback rather than merely editing the
+            Health ActorValue.
+
+            This also gives Skyrim the player as the attacker.
+        */
+
+        nearestActor->
+            DoDamage(
+                damage,
+                player,
+                true
+            );
+
+
+        const float healthAfter =
+            actorValueOwner->
+                GetActorValue(
+                    RE::ActorValue::
+                        kHealth
+                );
+
+
+        /*
+            Make a surviving non-teammate respond to the player.
+
+            SkyCraft does the same after applying its Minecraft
+            weapon hit.
+        */
+
+        if (
+            !nearestActor->
+                IsDead() &&
+            !nearestActor->
+                IsPlayerTeammate() &&
+            !nearestActor->
+                IsInCombat()
+        )
+        {
+            nearestActor->
+                StartCombat(
+                    player
+                );
+        }
+
+
+        SKSE::log::info(
+            "[skydoomskse] DOOM pistol actor HIT: actor={:08X} shots={} damage={} distance={} health={} -> {} candidates={}",
+            nearestActor->
+                GetFormID(),
+            shotCount,
+            damage,
+            nearestDistance,
+            healthBefore,
+            healthAfter,
+            testedActors
+        );
+    }
+
+    void ProcessDoomPistolCombatBridge(
+        bool doomFresh
+    )
+    {
+        /*
+            Only observe the guest while both Skyrim and DOOM
+            are actively in gameplay.
+
+            Losing the guest heartbeat, pausing, changing load
+            state, etc. invalidates the previous ammo snapshot.
+        */
+
+        if (
+            !g_state ||
+            !doomFresh ||
+            !g_state->doom.running ||
+            !g_state->doom.in_level ||
+            !g_state->skyrim.in_game ||
+            g_state->skyrim.paused
+        )
+        {
+            ResetDoomCombatSnapshot();
+            return;
+        }
+
+
+        const std::int32_t bullets =
+            g_state->doom.ammo_bullets;
+
+
+        const std::int32_t weapon =
+            g_state->doom.weapon;
+
+
+        const std::uint64_t tick =
+            g_state->doom.tick_counter;
+
+
+        /*
+            First valid sample, or guest restart / tick reset:
+            establish a baseline without generating a shot.
+        */
+
+        if (
+            !g_haveDoomCombatSnapshot ||
+            tick <
+                g_lastDoomCombatTick
+        )
+        {
+            g_lastDoomBullets =
+                bullets;
+
+            g_lastDoomWeapon =
+                weapon;
+
+            g_lastDoomCombatTick =
+                tick;
+
+            g_haveDoomCombatSnapshot =
+                true;
+
+            return;
+        }
+
+
+        const std::int32_t
+            previousBullets =
+                g_lastDoomBullets;
+
+
+        const std::int32_t
+            previousWeapon =
+                g_lastDoomWeapon;
+
+
+        /*
+            Update the snapshot BEFORE processing the shot so
+            every ammo transition is consumed only once.
+        */
+
+        g_lastDoomBullets =
+            bullets;
+
+        g_lastDoomWeapon =
+            weapon;
+
+        g_lastDoomCombatTick =
+            tick;
+
+
+        /*
+            A real bullet was consumed by Chocolate Doom.
+
+            Ammo increases from pickups are naturally ignored.
+        */
+
+        std::int32_t shotCount =
+            previousBullets -
+            bullets;
+
+
+        if (shotCount <= 0)
+        {
+            return;
+        }
+
+
+        /*
+            This first bridge handles the pistol only.
+
+            Accept either the previous or current readyweapon
+            as pistol so a same-tick weapon transition cannot
+            accidentally discard the final pistol shot.
+        */
+
+        if (
+            previousWeapon !=
+                SKYDOOM_DOOM_WEAPON_PISTOL &&
+            weapon !=
+                SKYDOOM_DOOM_WEAPON_PISTOL
+        )
+        {
+            return;
+        }
+
+
+        /*
+            Defensive cap. At our current update frequency a
+            legitimate pistol transition should normally be 1.
+        */
+
+        if (shotCount > 4)
+        {
+            shotCount =
+                4;
+        }
+
+
+        // SKYDOOM_HITSCAN_DIAGNOSTICS_V4
+        SKSE::log::info(
+            "[skydoomskse] DOOM pistol shot detected: shots={} bullets={} weapon={} tick={}",
+            shotCount,
+            bullets,
+            weapon,
+            tick
+        );
+
+        ApplyDoomPistolDamageToCrosshairActor(
+            shotCount
+        );
+    }
+
+	void UpdateSharedState()
+	{
+		if (!g_state) {
+			return;
+		}
+
+		const auto now =
+			static_cast<
+				std::uint64_t>(
+				GetTickCount64());
+
+		g_state->skyrim.running =
+			1;
+
+		g_state->skyrim.pid =
+			GetCurrentProcessId();
+
+		g_state->skyrim.heartbeat_ms =
+			now;
+
+		g_state->skyrim.update_counter++;
+
+		auto* ui =
+			RE::UI::
+				GetSingleton();
+
+		const bool paused =
+			ui &&
+			ui->GameIsPaused();
+
+		g_state->skyrim.paused =
+			paused ?
+				1u :
+				0u;
+
+		auto* player =
+			RE::PlayerCharacter::
+				GetSingleton();
+
+		if (player) {
+			const auto position =
+				player->GetPosition();
+
+			g_state->skyrim.player_x =
+				position.x;
+
+			g_state->skyrim.player_y =
+				position.y;
+
+			g_state->skyrim.player_z =
+				position.z;
+
+			g_state->skyrim.player_yaw =
+				player->GetAngleZ();
+
+			g_state->skyrim.player_pitch =
+				player->GetAngleX();
+
+			g_state->skyrim.in_game =
+				(player->GetParentCell() &&
+					!paused) ?
+					1u :
+					0u;
+		} else {
+			g_state->skyrim.in_game =
+				0;
+		}
+
+		const bool doomFresh =
+			DoomHeartbeatIsFresh();
+
+        // SKYDOOM_PROCESS_PISTOL_COMBAT_V4
+        ProcessDoomPistolCombatBridge(
+            doomFresh
+        );
+
+        // SKYDOOM_APPLY_PRESENTATION_V4
+        ApplySkyDoomPresentation(
+            doomFresh &&
+            g_state->skyrim.in_game
+        );
+
+		if (
+			doomFresh &&
+			!g_reportedDoomConnected) {
+			g_reportedDoomConnected =
+				true;
+
+			logger::info(
+				"Hidden DOOM guest connected. PID={}",
+				g_state->doom.pid);
+
+			if (
+				auto* console =
+					RE::ConsoleLog::
+						GetSingleton()) {
+				console->Print(
+					"[skydoomskse] Hidden DOOM guest connected!");
+			}
+		} else if (
+			!doomFresh) {
+			g_reportedDoomConnected =
+				false;
+		}
+	}
+
+	void StartUpdateThread()
+	{
+		if (
+			g_running.exchange(
+				true)) {
+			return;
+		}
+
+		g_updateThread =
+			std::jthread(
+				[](
+					std::stop_token
+						stopToken) {
+					while (
+						!stopToken.stop_requested() &&
+						g_running.load()) {
+						std::this_thread::
+							sleep_for(
+								std::chrono::
+									milliseconds(
+										50));
+
+						if (
+							g_taskPending.exchange(
+								true)) {
+							continue;
+						}
+
+						auto* taskInterface =
+							SKSE::
+								GetTaskInterface();
+
+						if (!taskInterface) {
+							g_taskPending =
+								false;
+
+							continue;
+						}
+
+						taskInterface->AddTask(
+							[]() {
+								UpdateSharedState();
+
+								g_taskPending =
+									false;
+							});
+					}
+				});
+
+		logger::info(
+			"SkyDoom Skyrim state loop started");
+	}
+
+	// ========================================================
+	// STARTUP
+	// ========================================================
+
+	void OnDataLoaded()
+	{
+		logger::info(
+			"SkyDoom Visual Overlay v4 DataLoaded");
+
+		if (
+			!InitSharedMemory()) {
+			logger::error(
+				"Failed to initialise SkyDoom v4 shared memory");
+
+			return;
+		}
+
+		if (
+			!RegisterInputSink()) {
+			logger::error(
+				"Failed to register SkyDoom input sink");
+
+			return;
+		}
+
+		if (
+			!InstallRenderHook()) {
+			logger::error(
+				"Failed to install SkyDoom native D3D11 rendering hook");
+		}
+
+		UpdateSharedState();
+
+		StartUpdateThread();
+
+		if (
+			!LaunchDoomGuest()) {
+			logger::error(
+				"Failed to launch hidden DOOM guest");
+		}
+
+		const auto* plugin =
+			SKSE::PluginDeclaration::
+				GetSingleton();
+
+		const auto name =
+			plugin ?
+				plugin->GetName() :
+				"SkyDoomSKSE";
+
+		if (
+			auto* console =
+				RE::ConsoleLog::
+					GetSingleton()) {
+			console->Print(
+				"[%s] SkyDoom Visual Overlay v4 loaded successfully!",
+				std::string(
+					name)
+					.c_str());
+
+			if (
+				g_renderHookInstalled) {
+				console->Print(
+					"[skydoomskse] Native DOOM weapon renderer installed!");
+			}
+		}
+
+		logger::info(
+			"SkyDoom Visual Overlay v4 startup complete");
+	}
+}
+
+SKSEPluginLoad(
+	const SKSE::LoadInterface*
+		a_skse)
+{
+	SKSE::Init(
+		a_skse);
+
+	SetupLog();
+
+	const auto* plugin =
+		SKSE::PluginDeclaration::
+			GetSingleton();
+
+	if (!plugin) {
+		return false;
+	}
+
+	logger::info(
+		"{} v{} loaded",
+		plugin->GetName(),
+		plugin->GetVersion());
+
+	const auto* messaging =
+		SKSE::
+			GetMessagingInterface();
+
+	if (!messaging) {
+		return false;
+	}
+
+	if (
+		!messaging->RegisterListener(
+			[](
+				SKSE::
+					MessagingInterface::
+						Message*
+							a_msg) {
+				switch (
+					a_msg->type) {
+				case SKSE::
+					MessagingInterface::
+						kDataLoaded:
+
+					OnDataLoaded();
+
+					break;
+
+				default:
+
+					break;
+				}
+			})) {
+		return false;
+	}
+
+	return true;
+}

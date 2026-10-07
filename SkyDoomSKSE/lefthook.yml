@@ -1,0 +1,61 @@
+commit-msg:
+  commands:
+    conventional-commit:
+      run: |
+        msg=$(head -n1 "{1}")
+        pattern='^(feat|fix|chore|refactor)(\([^()\s]+\))?!?: .+'
+        if ! echo "$msg" | grep -Pq "$pattern"; then
+          echo "Commit message must follow Conventional Commits format."
+          echo "Allowed types: feat, fix, chore, refactor"
+          echo "Examples: feat: add hook, fix(ci): correct preset, chore(cmake): bump version"
+          echo "Got: $msg"
+          exit 1
+        fi
+
+pre-commit:
+  commands:
+    clang-format:
+      glob:
+        - "src/*.cpp"
+        - "src/*.h"
+        - "src/**/*.cpp"
+        - "src/**/*.h"
+        - "test/*.cpp"
+        - "test/**/*.cpp"
+      run: clang-format -i {staged_files}
+      stage_fixed: true
+    cmake-format:
+      glob:
+        - "CMakeLists.txt"
+        - "*.cmake"
+        - "**/*.cmake"
+      run: cmake-format -i {staged_files}
+      stage_fixed: true
+    check-trailing-whitespace:
+      run: if grep -IPrn '\s+$' {staged_files}; then exit 1; fi; exit 0
+      fail_text: "Trailing whitespace found"
+    check-eof-newline:
+      run: for f in {staged_files}; do grep -qI '' "$f" && [ -s "$f" ] && [ "$(tail -c1 "$f" | wc -l)" -eq 0 ] && echo "$f missing newline at EOF" && exit 1; done; exit 0
+      fail_text: "File(s) missing newline at end of file"
+    clang-tidy:
+      glob:
+        - "src/*.cpp"
+        - "src/**/*.cpp"
+      run: clang-tidy -p build/release-linux --warnings-as-errors='*' {staged_files}
+      fail_text: "clang-tidy reported issues (run ./scripts/build.sh first if compile_commands.json is missing)"
+    shellcheck:
+      glob: "scripts/*.sh"
+      run: shellcheck {staged_files}
+      fail_text: "shellcheck found issues"
+    dprint-markdown:
+      glob:
+        - "README.md"
+        - "docs/**/*.md"
+      run: dprint fmt {staged_files}
+      stage_fixed: true
+    vale-markdown:
+      glob:
+        - "README.md"
+        - "docs/**/*.md"
+      run: vale {staged_files}
+      fail_text: "vale found markdown prose issues"

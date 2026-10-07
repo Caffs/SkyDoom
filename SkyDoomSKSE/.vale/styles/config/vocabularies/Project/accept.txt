@@ -1,0 +1,15 @@
+ExampleMod
+SKSE
+SKSE64
+CommonLibSSE-NG
+Lefthook
+NexusMods
+GitHub
+vcpkg
+CMake
+clangd
+clang-format
+clang-tidy
+dprint
+Vale
+xwin

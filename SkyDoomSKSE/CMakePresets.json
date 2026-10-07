@@ -1,0 +1,158 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 21,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "_vcpkg",
+            "hidden": true,
+            "toolchainFile": "${sourceDir}/lib/vcpkg/scripts/buildsystems/vcpkg.cmake",
+            "cacheVariables": {
+                "VCPKG_OVERLAY_TRIPLETS":  "${sourceDir}/cmake/triplets",
+                "VCPKG_OVERLAY_PORTS":     "${sourceDir}/cmake/ports",
+                "VCPKG_MANIFEST_MODE":     "ON",
+                "VCPKG_INSTALL_OPTIONS":   "--allow-unsupported",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "_ninja",
+            "hidden": true,
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_MAKE_PROGRAM": "ninja"
+            }
+        },
+        {
+            "name": "_clang-cl-linux",
+            "hidden": true,
+            "cacheVariables": {
+                "VCPKG_TARGET_TRIPLET":           "x64-llvm-mingw-static",
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/clang-cl-cross.cmake",
+                "VCPKG_APPLOCAL_DEPS":            "OFF"
+            }
+        },
+        {
+            "name": "_msvc",
+            "hidden": true,
+            "cacheVariables": {
+                "VCPKG_TARGET_TRIPLET": "x64-windows-static-md",
+                "VCPKG_HOST_TRIPLET":   "x64-windows-static-md"
+            }
+        },
+        {
+            "name": "release-linux",
+            "displayName": "Release (Linux, clang-cl + xwin)",
+            "description": "Cross-compile for Skyrim SE/AE from Linux using clang-cl, lld-link and xwin headers",
+            "inherits": ["_vcpkg", "_ninja", "_clang-cl-linux"],
+            "binaryDir": "${sourceDir}/build/release-linux",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "release-windows",
+            "displayName": "Release (Windows, MSVC + Ninja)",
+            "description": "Build for Skyrim SE/AE on Windows using MSVC and Ninja",
+            "inherits": ["_vcpkg", "_ninja", "_msvc"],
+            "binaryDir": "${sourceDir}/build/msvc",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "tidy-windows",
+            "displayName": "Tidy (Windows, MSVC + Ninja)",
+            "description": "Configure-only preset for running clang-tidy on Windows with MSVC headers",
+            "inherits": ["_vcpkg", "_ninja", "_msvc"],
+            "binaryDir": "${sourceDir}/build/tidy",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_DISABLE_PRECOMPILE_HEADERS": "ON"
+            }
+        },
+        {
+            "name": "test-windows",
+            "displayName": "Test (Windows, MSVC + Ninja)",
+            "description": "Build and run unit tests on Windows with MSVC",
+            "inherits": ["_vcpkg", "_ninja", "_msvc"],
+            "binaryDir": "${sourceDir}/build/test-windows",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "PLUGIN_TESTS_ONLY": "ON",
+                "VCPKG_MANIFEST_FEATURES": "tests"
+            }
+        },
+        {
+            "name": "test-linux",
+            "displayName": "Test (Linux, native)",
+            "description": "Build and run unit tests natively on Linux against the system Catch2",
+            "inherits": ["_ninja"],
+            "binaryDir": "${sourceDir}/build/test-linux",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "PLUGIN_TESTS_ONLY": "ON"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "release-linux",
+            "displayName": "Release (Linux)",
+            "configurePreset": "release-linux"
+        },
+        {
+            "name": "release-windows",
+            "displayName": "Release (Windows)",
+            "configurePreset": "release-windows"
+        },
+        {
+            "name": "deploy",
+            "displayName": "Deploy to mod manager",
+            "configurePreset": "release-linux",
+            "targets": ["deploy"]
+        },
+        {
+            "name": "test-windows",
+            "displayName": "Test (Windows)",
+            "configurePreset": "test-windows"
+        },
+        {
+            "name": "test-linux",
+            "displayName": "Test (Linux)",
+            "configurePreset": "test-linux"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "test-windows",
+            "displayName": "Test (Windows)",
+            "configurePreset": "test-windows",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "test-linux",
+            "displayName": "Test (Linux)",
+            "configurePreset": "test-linux",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ],
+    "packagePresets": [],
+    "workflowPresets": [
+        {
+            "name": "deploy",
+            "displayName": "Build & Deploy to mod manager",
+            "steps": [
+                { "type": "configure", "name": "release-linux" },
+                { "type": "build",     "name": "deploy" }
+            ]
+        }
+    ]
+}

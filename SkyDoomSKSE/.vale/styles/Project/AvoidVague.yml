@@ -1,0 +1,10 @@
+extends: existence
+message: "Avoid vague wording like '%s'."
+level: warning
+ignorecase: true
+tokens:
+  - just
+  - simply
+  - obviously
+  - easy
+  - easily

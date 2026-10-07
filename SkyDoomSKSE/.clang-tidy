@@ -1,0 +1,27 @@
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  cert-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  readability-*,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-type-vararg,
+  -readability-braces-around-statements,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -cppcoreguidelines-pro-bounds-avoid-unchecked-container-access,
+  -readability-implicit-bool-conversion,
+  -modernize-use-trailing-return-type,
+  -bugprone-easily-swappable-parameters,
+  -cert-err58-cpp,
+  -performance-enum-size
+
+HeaderFilterRegex: '^(?!.*(extern|imgui|RE|SKSE|CommonLibSSE|spdlog)).*'
+FormatStyle: file
+WarningsAsErrors: ''
+

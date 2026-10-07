@@ -1,0 +1,29 @@
+[changelog]
+header = ""
+body = """
+{% for group, commits in commits | group_by(attribute="group") -%}
+## {{ group }}
+{% for commit in commits -%}
+- {{ commit.message | upper_first }}
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+commit_preprocessors = [
+    { pattern = '(?m) \(#\d+\)$', replace = "" },
+]
+commit_parsers = [
+    { message = "^[a-z]+(\\([^)]+\\))?!:", group = "Breaking Changes" },
+    { message = "^feat\\((ci|build|docs|test|style)\\)", skip = true },
+    { message = "^fix\\((ci|build|docs|test|style)\\)", skip = true },
+    { message = "^feat", group = "New Features" },
+    { message = "^fix", group = "Bug Fixes" },
+    { message = "^chore", skip = true },
+    { message = "^refactor", skip = true },
+    { message = ".*", skip = true },
+]
+filter_commits = true
