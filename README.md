@@ -26,7 +26,7 @@ need your own legitimate supported copies of:
 
 - Skyrim Special Edition / Anniversary Edition
 - DOOM + DOOM II
-- SKSE for the supported Skyrim runtime
+- [SKSE 2.3.1 for Skyrim 1.7.104 (Steam)](https://www.nexusmods.com/skyrimspecialedition/mods/30379?tab=files)
 - [Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444) for Skyrim SE/AE
 
 Steam: https://store.steampowered.com/app/2280/DOOM__DOOM_II/
