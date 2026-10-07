@@ -19,8 +19,22 @@ Tested configuration:
 - Steam DOOM + DOOM II / AppID 2280 installation layout
 - Windows 10/11
 
-The beta automatically discovers the player's own legitimate `DOOM.WAD` from
-their Steam libraries.
+## Requirements / game ownership
+
+SkyDoom does **not** include Skyrim or DOOM game files. To use the beta, you
+need your own legitimate supported copies of:
+
+- Skyrim Special Edition / Anniversary Edition
+- DOOM + DOOM II
+- SKSE for the supported Skyrim runtime
+
+Steam: https://store.steampowered.com/app/2280/DOOM__DOOM_II/
+
+At the time of the v0.1.0-beta release, DOOM + DOOM II is on sale for **£3.19
+in the UK**. Steam pricing and sales can change.
+
+SkyDoom automatically discovers the player's own legitimate `DOOM.WAD` from
+their Steam libraries, so there is no need to copy DOOM WAD files into the mod.
 
 ## What SkyDoom currently does
 
