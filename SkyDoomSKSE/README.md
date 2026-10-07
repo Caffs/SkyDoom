@@ -12,7 +12,7 @@ Supports building on **Linux** (cross-compilation via `clang-cl` + [xwin](https:
 ## Requirements
 
 - [SKSE64](https://skse.silverlock.org/)
-- [Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444) for SE and AE, or [VR Address Library for SKSEVR](https://www.nexusmods.com/skyrimspecialedition/mods/58101) for VR
+- [Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444) for Skyrim SE/AE
 
 ## Installation
 
@@ -30,7 +30,9 @@ Supports building on **Linux** (cross-compilation via `clang-cl` + [xwin](https:
 
 ## Compatibility
 
-- Compatible with Skyrim SE, AE, and VR.
+- **Tested configuration:** Skyrim runtime 1.7.104.0 (Steam) with SKSE 2.3.1.
+- SkyDoom is built with CommonLibSSE-NG support enabled for SE, AE, and VR, but **Skyrim VR has not been tested and is not currently claimed as supported**.
+- Other Skyrim runtimes and configurations have not yet been validated.
 - No ESP/ESL required.
 
 <!-- nexus:end -->
