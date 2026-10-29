@@ -296,4 +296,4 @@ python3 scripts/generate-nexus-page.py --copy
 
 ## License
 
-Copyright (c) 2026 skydoomskse Contributors. Licensed under the GNU GPL v3.0 or later; see [LICENSE](LICENSE). CommonLibSSE-NG is also GPL-3.0-or-later, so mods built from this template are distributed under the same terms.
+Copyright (C) 2026 Caffs. Licensed under the GNU GPL v3.0 or later; see [LICENSE](LICENSE). CommonLibSSE-NG is also GPL-3.0-or-later, so mods built from this template are distributed under the same terms.
